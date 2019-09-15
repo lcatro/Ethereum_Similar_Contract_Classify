@@ -1,0 +1,460 @@
+
+from subprocess import *
+from sys import *
+
+from simhash import Simhash
+
+
+
+
+
+def disassmbly_contract(evm_bytecode_file_path) :
+	popen_object = Popen(['./evm','disasm',evm_bytecode_file_path],stdout = PIPE)
+	disassmbly_data = popen_object.stdout.read()
+
+	if not -1 == disassmbly_data.find('invalid') or not len(disassmbly_data.strip()) :
+		return False
+
+	disassmbly_data = disassmbly_data.split('\n')
+	disassmbly_data = disassmbly_data[ 1 : ]  #  first line is source bytecode print
+	format_data = {}
+
+	for index in disassmbly_data :
+		if not len(index) :
+			continue
+
+		opcode = index.split(' ')
+
+		if 'Missing' == opcode[1] :
+			continue
+
+		opcode_address = int('0x' + opcode[0].split(':')[0],16)  #  clean the ":" in address common and convert hex number
+		format_data[opcode_address] = opcode[1 : ]
+
+	return format_data
+
+def get_contract_runtime_entry(disassmbly_data) :
+	disassmbly_address_list = disassmbly_data.keys()
+	disassmbly_address_list_length = len(disassmbly_address_list)
+
+	for index in range(disassmbly_address_list_length) :
+		if  'PUSH1' == disassmbly_data[disassmbly_address_list[index]][0] and \
+			'PUSH1' == disassmbly_data[disassmbly_address_list[index + 1]][0] and \
+			'MSTORE' == disassmbly_data[disassmbly_address_list[index + 2]][0] and \
+			'PUSH1' == disassmbly_data[disassmbly_address_list[index + 3]][0] and '0x04' == disassmbly_data[disassmbly_address_list[index + 3]][1] and \
+			'CALLDATASIZE' == disassmbly_data[disassmbly_address_list[index + 4]][0] :
+			return disassmbly_address_list[index]
+		elif 'PUSH1' == disassmbly_data[disassmbly_address_list[index]][0] and \
+			'PUSH1' == disassmbly_data[disassmbly_address_list[index + 1]][0] and \
+			'MSTORE' == disassmbly_data[disassmbly_address_list[index + 2]][0] and \
+			'CALLDATASIZE' == disassmbly_data[disassmbly_address_list[index + 3]][0] :
+			return disassmbly_address_list[index]
+
+	return -1
+
+def split_bytecode(disassmbly_data,start_offset,end_offset = -1) :
+	disassmbly_address_list = disassmbly_data.keys()
+
+	if not start_offset in disassmbly_address_list :
+		return False
+
+	if 0 < end_offset :
+		if not end_offset in disassmbly_address_list or start_offset >= end_offset:
+			return False
+	else :
+		end_offset = disassmbly_address_list[-1]
+
+	address_list_start_offset = disassmbly_address_list.index(start_offset)
+	address_list_end_offset = disassmbly_address_list.index(end_offset)
+	new_disassmbly_address_list = disassmbly_address_list[address_list_start_offset : address_list_end_offset + 1]
+	new_disassmbly_data = {}
+
+	for index in new_disassmbly_address_list :
+		new_disassmbly_data[index - start_offset] = disassmbly_data[index]
+
+	return new_disassmbly_data
+
+def append_bytecode(disassmbly_data,new_disassmbly_data) :
+	disassmbly_address_list = disassmbly_data.keys()
+
+	if len(disassmbly_address_list) :
+		last_offset = disassmbly_address_list[-1]
+		last_opcode = disassmbly_data[last_offset][0]
+
+		if last_opcode.startswith('PUSH') :  #  only PUSH will takes more byte-length,other bytecode length is 1
+			push_length = int(last_opcode[ 4 : ])
+			last_offset += 1 + push_length
+		else :
+			last_offset += 1
+	else :
+		last_offset = 0
+
+	new_disassmbly_address_list = new_disassmbly_data.keys()
+	new_disassmbly_start_offset = new_disassmbly_address_list[0]
+
+	for index in new_disassmbly_address_list :
+		fix_new_disassmbly_offset = index - new_disassmbly_start_offset
+		disassmbly_data[last_offset + fix_new_disassmbly_offset] = new_disassmbly_data[index]
+
+	return disassmbly_data
+
+def get_function_entry(disassmbly_data) :
+	function_entry_flag = ['PUSH1','CALLDATALOAD']
+	disassmbly_opcode_list = disassmbly_data.values()
+	disassmbly_opcode_list_length = len(disassmbly_opcode_list)
+	entry_offset = 0
+
+	for index in range(disassmbly_opcode_list_length) :
+		print index,disassmbly_opcode_list[index]
+		if  function_entry_flag[0] == disassmbly_opcode_list[index][0] and \
+			function_entry_flag[1] == disassmbly_opcode_list[index + 1][0] :
+			entry_offset = index + 4
+
+			break
+
+	if not entry_offset :
+		return False
+
+	disassmbly_opcode_list = disassmbly_data.values()
+	disassmbly_opcode_list_length = len(disassmbly_opcode_list)
+	function_entry = {}
+	current_function_hash = 0
+
+	for index in range(entry_offset,disassmbly_opcode_list_length) :
+		current_opcode = disassmbly_opcode_list[index][0]
+		print index,disassmbly_opcode_list[index]
+		if 'JUMPDEST' == current_opcode :
+	 		break
+
+	 	if 'PUSH4' == current_opcode :
+	 		current_function_hash = disassmbly_opcode_list[index][1]
+	 	elif 'PUSH1' == current_opcode or 'PUSH2' == current_opcode :
+	 		if current_function_hash :
+		 		function_entry[current_function_hash] = int(disassmbly_opcode_list[index][1],16)
+
+	 		current_function_hash = 0
+
+	return function_entry
+
+def get_function_code(disassmbly_data,function_entry_address) :
+	if not function_entry_address in disassmbly_data.keys() :  #  invalid entry address
+		return False
+
+	function_entry_flag = disassmbly_data[function_entry_address][0]
+	disassmbly_data_length = len(disassmbly_data)
+	disassmbly_address_list = disassmbly_data.keys()
+	disassmbly_address_list_length = len(disassmbly_address_list)
+	function_code = {}
+
+	if not 'JUMPDEST' == function_entry_flag :
+		return False
+
+	#  1. analayis function pre-check 
+	
+	if 'CALLVALUE' == disassmbly_data[function_entry_address + 1][0] :
+		disassmbly_address_list_offset = disassmbly_address_list.index(function_entry_address + 2)
+		function_pre_check_end_offset = 0
+		function_argument_check_offset = 0
+
+		for index in range(disassmbly_address_list_offset,disassmbly_address_list_length) :
+			current_address = disassmbly_address_list[index]
+
+			if index + 1 == disassmbly_address_list_length :
+				break
+
+			next_address = disassmbly_address_list[index + 1]
+
+			if ('PUSH1' == disassmbly_data[current_address][0] or 'PUSH2' == disassmbly_data[current_address][0]) and \
+				'JUMPI' == disassmbly_data[next_address][0] :
+				function_argument_check_offset = int(disassmbly_data[current_address][1],16)
+
+			if 'JUMPDEST' == disassmbly_data[next_address][0] :
+				function_pre_check_end_offset = current_address
+
+				break
+
+		function_pre_check_code = split_bytecode(disassmbly_data,function_entry_address,function_pre_check_end_offset)
+
+		if not function_argument_check_offset :
+			return False
+
+		if not 'JUMPDEST' == disassmbly_data[function_argument_check_offset][0] :
+			return False
+
+		disassmbly_address_list_offset = disassmbly_address_list.index(function_argument_check_offset)
+
+		append_bytecode(function_code,function_pre_check_code)
+	else :  #  this isn't pre-check flag , maybe still jump into argument-check ..
+		function_argument_check_offset = function_entry_address
+		disassmbly_address_list_offset = disassmbly_address_list.index(function_argument_check_offset)
+
+	#  2. analayis function argument-check
+
+	function_argument_check_end_offset = 0
+	function_main_c_offset = 0
+	function_return_offset = 0
+
+	for index in range(disassmbly_address_list_offset,disassmbly_address_list_length) :
+		current_address = disassmbly_address_list[index]
+
+		if index + 2 == disassmbly_address_list_length :
+			break
+
+		next_address = disassmbly_address_list[index + 1]
+		next_next_address = disassmbly_address_list[index + 2]
+
+		#print hex(current_address),disassmbly_data[current_address]
+
+		if (('JUMPDEST' == disassmbly_data[current_address][0]) and 
+			('PUSH1' == disassmbly_data[next_address][0] or 'PUSH2' == disassmbly_data[next_address][0]) and \
+			('PUSH1' == disassmbly_data[next_next_address][0] or 'PUSH2' == disassmbly_data[next_next_address][0]) and \
+			not function_return_offset) :
+			function_return_offset = int(disassmbly_data[next_address][1],16)
+		elif (('PUSH1' == disassmbly_data[current_address][0] or 'PUSH2' == disassmbly_data[current_address][0]) and \
+			(disassmbly_data[next_address][0].startswith('SWAP')) and \
+			not function_return_offset) :
+			function_return_offset = int(disassmbly_data[current_address][1],16)
+		elif (('POP' == disassmbly_data[current_address][0]) and \
+			('PUSH1' == disassmbly_data[next_address][0] or 'PUSH2' == disassmbly_data[next_address][0]) and \
+			not function_return_offset) :
+
+			if not (disassmbly_data[next_next_address][0].startswith('DUP')) :
+				function_return_offset = int(disassmbly_data[next_address][1],16)
+
+		if 'JUMPDEST' == disassmbly_data[next_address][0] :
+			function_argument_check_end_offset = current_address
+
+			#  reverse to search the opcode push ..
+			for reverse_index in range(index,disassmbly_address_list_offset,-1) :
+				current_address = disassmbly_address_list[reverse_index]
+
+				if ('PUSH1' == disassmbly_data[current_address][0] or 'PUSH2' == disassmbly_data[current_address][0]) :
+					function_main_c_offset = int(disassmbly_data[current_address][1],16)
+					break
+
+			break
+
+	function_argument_check_code = split_bytecode(disassmbly_data,function_argument_check_offset,function_argument_check_end_offset)
+
+	print hex(function_entry_address),hex(function_argument_check_offset),hex(function_main_c_offset),hex(function_return_offset)
+
+	if not function_main_c_offset or not function_return_offset :
+ 		return False
+
+	if not 'JUMPDEST' == disassmbly_data[function_main_c_offset][0] :
+		return False
+
+	disassmbly_address_list_offset = disassmbly_address_list.index(function_main_c_offset)
+
+	append_bytecode(function_code,function_argument_check_code)
+
+	#  3. get function main code
+
+	function_main_code_end_offset = 0
+
+	for index in range(disassmbly_address_list_offset,disassmbly_address_list_length) :
+		current_address = disassmbly_address_list[index]
+
+		if 'JUMP' == disassmbly_data[current_address][0] :
+			function_main_code_end_offset = current_address
+
+			break
+
+	if not function_main_code_end_offset  :
+ 		return False
+
+	function_main_code = split_bytecode(disassmbly_data,function_main_c_offset,function_main_code_end_offset)
+
+	append_bytecode(function_code,function_main_code)
+
+	#  4. get return code
+
+	disassmbly_address_list_offset = disassmbly_address_list.index(function_return_offset)
+	function_return_code_end_offset = 0
+
+	for index in range(disassmbly_address_list_offset,disassmbly_address_list_length) :
+		current_address = disassmbly_address_list[index]
+
+		if 'STOP' == disassmbly_data[current_address][0] or 'RETURN' == disassmbly_data[current_address][0] :
+			function_return_code_end_offset = current_address
+
+			break
+
+	if not function_return_code_end_offset  :
+ 		return False
+
+	function_return_code = split_bytecode(disassmbly_data,function_return_offset,function_return_code_end_offset)
+
+	append_bytecode(function_code,function_return_code)
+
+	return sort_disassmbly_data(function_code)
+
+def sort_disassmbly_data(disassmbly_data) :
+	sort_opcode_address = sorted(disassmbly_data.keys())
+	sort_opcode_list = {}
+
+	for sort_index in sort_opcode_address :
+		print sort_index,disassmbly_data[sort_index]
+		sort_opcode_list[sort_index] = disassmbly_data[sort_index]
+	print sort_opcode_list
+	return sort_opcode_list
+
+def print_function_code(disassmbly_data) :
+	sort_list = sorted(disassmbly_data.keys())
+
+	for index in sort_list :
+		print index,':',disassmbly_data[index]
+
+def get_contract_functions_code(file_path,is_debug = False) :
+	disasm_file_data = disassmbly_contract(file_path)
+
+	if is_debug :
+		print 'disasm_file_data =',disasm_file_data
+
+	disasm_file_contract_runtime_entry = get_contract_runtime_entry(disasm_file_data)
+
+	if is_debug :
+		print 'contract_runtime_entry =',disasm_file_contract_runtime_entry
+
+	if not -1 == disasm_file_contract_runtime_entry :
+		disasm_file_data = split_bytecode(disasm_file_data,disasm_file_contract_runtime_entry)
+
+	disasm_file_data = sort_disassmbly_data(disasm_file_data)
+
+	if is_debug :
+		print 'disasm_file_contract_runtime_data =',disasm_file_data
+
+	entry_list = get_function_entry(disasm_file_data)
+
+	if is_debug :
+		print 'entry_list =',entry_list
+	
+	function_entry = {}
+
+	for function_entry_index in entry_list.keys() :
+		function_code = get_function_code(disasm_file_data,entry_list[function_entry_index])
+
+		if is_debug :
+			print '%s -->' % function_entry_index
+			print_function_code(function_code)
+
+		function_entry[function_entry_index] = function_code
+
+	return function_entry
+
+def get_function_simhash(code_data) :
+	def get_features(data) :
+		new_data = []
+
+		for opcode_index in data.keys() :
+			new_data.append(data[opcode_index][0])
+
+		return new_data
+
+	code_data_simhash_list = {}
+
+	for function_entry_index in code_data :
+		code_data_simhash_list[function_entry_index] = Simhash(get_features(code_data[function_entry_index]))
+
+	return code_data_simhash_list
+
+def merge_simhash_check(code_data1,code_data2) :
+	merge_result = {}
+
+	for code_data1_function_index in code_data1.keys() :
+		min_distance = 200  #  no distance bigger than this number ..
+		current_function_hash = ''
+
+		for code_data2_function_index in code_data2.keys() :
+			current_distance = code_data1[code_data1_function_index].distance(code_data2[code_data2_function_index])
+
+			if current_distance < min_distance :
+				min_distance = current_distance
+				current_function_hash = code_data2_function_index
+
+		#  I try some simulator function code (modify little code ).If they are simluar ,the distance value is <= 6 .
+
+		merge_result['%s_%s' % (code_data1_function_index,current_function_hash)] = float('%.2f' % pow(0.935,min_distance))  #  luck nunmber ..
+
+	return merge_result
+
+def calculate_merge_result(merge_result) :
+	point = 0.0
+
+	for merge_index in merge_result :
+		if merge_result[merge_index] > 0.7 :  #  0.6 is simualte value ..
+			point += 1
+
+	return point / len(merge_result)
+
+def is_mapping_object(disassmbly_code) :
+	'''
+		In solidity ,mapping object be complie to function .
+		So we can see that many contract using mapping object ,if check tow contracts simulator . 
+		This mapping object's simhash value is 1 .
+	'''
+
+	disassmbly_address_list = sorted(disassmbly_code.keys(),reverse = True)
+	last_opcode_offset = disassmbly_address_list[-1]
+
+	if not 'RETURN' == disassmbly_code[last_opcode_offset][0] :
+		return False
+
+	for return_code_offset in disassmbly_address_list :
+		if 'JUMPDEST' == disassmbly_code[return_code_offset][0] :
+			break
+
+	return_code_offset
+
+
+def check_contract_simulate(code_path1,code_path2) :
+	code_data1 = get_contract_functions_code(argv[1])
+	code_data2 = get_contract_functions_code(argv[2],True)
+	exit()
+	print code_data1
+	print code_data2
+	print '---'
+	print_function_code(code_data1['0xcc6c0b8d'])
+	print '>>>'
+	print_function_code(code_data1['0x66e41cb7'])
+	print '>>>'
+	print_function_code(code_data2['0x66e41cb7'])
+
+	function_simhash1 = get_function_simhash(code_data1)
+	function_simhash2 = get_function_simhash(code_data2)
+
+	#print function_simhash1
+	#print function_simhash2
+
+	merge_simhash_result1 = merge_simhash_check(function_simhash1,function_simhash2)
+	merge_simhash_result2 = merge_simhash_check(function_simhash2,function_simhash1)
+
+	#print merge_simhash_result1
+	#print merge_simhash_result2
+
+	merge_rate1 = calculate_merge_result(merge_simhash_result1)
+	merge_rate2 = calculate_merge_result(merge_simhash_result2)
+
+	#print merge_rate1
+	#print merge_rate2
+
+	return (merge_rate1 * merge_rate2)
+
+
+if __name__ == '__main__' :
+	if not 3 == len(argv) :
+		print 'Check.py file_path1 file_path2'
+
+		exit()
+
+	print check_contract_simulate(argv[1],argv[2])
+
+
+	'''
+	print Simhash(file_data1).value
+	print Simhash(file_data2).value
+	print Simhash(file_data1).distance(Simhash(file_data2))
+	print Simhash(get_features(file_data1)).value
+	print Simhash(get_features(file_data2)).value
+	print Simhash(get_features(file_data1)).distance(Simhash(get_features(file_data2)))
+	'''
